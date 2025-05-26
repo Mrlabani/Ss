@@ -17,18 +17,48 @@ class AdultScraper {
   }
 
   async extractVideoMetadata(url) {
-    const $ = await this.getHTML(url);
-    const jsonLdText = $('script[type="application/ld+json"]').html();
-    if (!jsonLdText) throw new Error("No metadata found");
+    const { data } = await axios.get(url, {
+      headers: { "User-Agent": "Magic Browser" },
+    });
 
-    const data = JSON.parse(jsonLdText);
+    // Load HTML for parsing
+    const $ = cheerio.load(data);
+
+    // Try to find video URL inside page scripts
+    // Xvideos often has a script with "html5player.setVideoUrlHigh" or "setVideoUrlLow"
+    const scriptText = $("script")
+      .map((i, el) => $(el).html())
+      .get()
+      .join("\n");
+
+    let videoUrl = null;
+    const highMatch = scriptText.match(/html5player\.setVideoUrlHigh\('(.+?)'\)/);
+    const lowMatch = scriptText.match(/html5player\.setVideoUrlLow\('(.+?)'\)/);
+
+    if (highMatch) videoUrl = highMatch[1];
+    else if (lowMatch) videoUrl = lowMatch[1];
+
+    // Get thumbnail, title, description
+    const jsonLdText = $('script[type="application/ld+json"]').html();
+    let meta = {};
+    if (jsonLdText) {
+      try {
+        const data = JSON.parse(jsonLdText);
+        meta = {
+          name: data.name || "No title",
+          description: (data.description || "").trim(),
+          uploadDate: data.uploadDate || "Unknown",
+          thumbnail: Array.isArray(data.thumbnailUrl) ? data.thumbnailUrl[0] : data.thumbnailUrl,
+        };
+      } catch {
+        meta = {};
+      }
+    }
 
     return {
-      name: data.name || "No title",
-      description: (data.description || "").trim(),
-      uploadDate: data.uploadDate || "Unknown",
-      thumbnail: Array.isArray(data.thumbnailUrl) ? data.thumbnailUrl[0] : data.thumbnailUrl,
-      contentUrl: data.contentUrl || url,
+      ...meta,
+      videoUrl,
+      pageUrl: url,
     };
   }
 
@@ -66,12 +96,13 @@ async function sendMessage(chat_id, text, extra = {}) {
   });
 }
 
-async function sendPhoto(chat_id, photoUrl, caption) {
+async function sendPhoto(chat_id, photoUrl, caption, buttons) {
   return axios.post(`${TELEGRAM_API}/sendPhoto`, {
     chat_id,
     photo: photoUrl,
     caption,
     parse_mode: "Markdown",
+    reply_markup: buttons ? { inline_keyboard: buttons } : undefined,
   });
 }
 
@@ -92,7 +123,7 @@ module.exports = async (req, res) => {
     if (text.startsWith("/start")) {
       await sendMessage(
         chatId,
-        "Welcome! Use /search <query> to find videos.\nExample: /search cats"
+        "Welcome! Use /search <query> to find adult videos.\nExample: /search cats"
       );
     } else if (text.startsWith("/search")) {
       const query = text.split(" ").slice(1).join(" ");
@@ -110,8 +141,28 @@ module.exports = async (req, res) => {
       for (const link of links) {
         try {
           const meta = await scraper.extractVideoMetadata(link);
-          const message = `*${meta.name}*\n\n${meta.description}\n\nUploaded: ${meta.uploadDate}\n\n[Watch Video](${link})`;
-          await sendPhoto(chatId, meta.thumbnail, message);
+
+          if (!meta.videoUrl) {
+            await sendMessage(chatId, `Sorry, video URL not found for: ${meta.name || link}`);
+            continue;
+          }
+
+          const message = `*${meta.name}*\n\n${meta.description}\n\nUploaded: ${meta.uploadDate}\n\n[Watch Video Page](${meta.pageUrl})`;
+
+          const buttons = [
+            [
+              {
+                text: "▶️ Watch Video",
+                url: meta.pageUrl,
+              },
+              {
+                text: "⬇️ Download Video",
+                url: meta.videoUrl,
+              },
+            ],
+          ];
+
+          await sendPhoto(chatId, meta.thumbnail, message, buttons);
         } catch (err) {
           await sendMessage(chatId, `Error extracting metadata for ${link}`);
         }
